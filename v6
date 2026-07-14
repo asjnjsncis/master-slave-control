@@ -1,0 +1,476 @@
+#!/usr/bin/env python3
+"""
+Alicia-D → JAKA 主从控制 v8 (笛卡尔空间映射 + 旋转向量缩放)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+核心改进:
+  1. 齐次变换矩阵 (4x4) 映射两台机器人基座坐标系
+  2. 笛卡尔空间映射: Alicia TCP → 世界 → JAKA 基座
+  3. JAKA kine_inverse 逆运动学解算关节角 → servo_j
+  4. 旋转向量缩放姿态 (避免欧拉角线性插值万向锁)
+  5. 子进程关节空间指数平滑 (解决笛卡尔平滑与IK非线性冲突)
+  6. 子进程关节限幅 (max 3°/步, 防奇异点突变)
+  7. 手动校准偏移 (补偿安装位置差异)
+  8. set_collision_level(5) 避免误触发保护性停止
+  9. 拆分位置/姿态缩放系数 (pos_scale > 1 放大位置, rot_scale = 1.0 保持姿态)
+ 10. 笛卡尔软限位 (钳位到 JAKA 工作空间范围内, 防超程/逆解失败)
+"""
+
+import json
+import math
+import signal
+import subprocess
+import time
+import os
+from typing import List, Optional
+
+import numpy as np
+from alicia_d_sdk import create_robot
+from robocore.kinematics import forward_kinematics
+from robocore.transform import matrix_to_euler, euler_to_matrix
+
+
+def pos_euler_to_matrix(pos_mm, euler_deg):
+    """[x,y,z] mm + [rx,ry,rz]° → 4x4 齐次变换矩阵"""
+    T = np.eye(4)
+    T[:3, 3] = pos_mm
+    rad = [math.radians(a) for a in euler_deg]
+    T[:3, :3] = euler_to_matrix(rad[0], rad[1], rad[2], seq='xyz')
+    return T
+
+
+def rotation_vector_from_matrix(R):
+    """旋转矩阵 → 旋转向量 (轴×角度) 使用罗德里格斯公式"""
+    angle = math.acos(max(-1.0, min(1.0, (np.trace(R) - 1.0) / 2.0)))
+    if abs(angle) < 1e-8:
+        return np.zeros(3), 0.0
+    rx = R[2, 1] - R[1, 2]
+    ry = R[0, 2] - R[2, 0]
+    rz = R[1, 0] - R[0, 1]
+    norm = math.sqrt(rx*rx + ry*ry + rz*rz)
+    if norm < 1e-8:
+        return np.zeros(3), 0.0
+    axis = np.array([rx, ry, rz]) / norm
+    return axis, angle
+
+
+def matrix_from_rotation_vector(axis, angle):
+    """旋转向量 (轴, 角度) → 旋转矩阵 使用罗德里格斯公式"""
+    if abs(angle) < 1e-8:
+        return np.eye(3)
+    c = math.cos(angle)
+    s = math.sin(angle)
+    v = 1 - c
+    x, y, z = axis
+    return np.array([
+        [c + x*x*v,   x*y*v - z*s, x*z*v + y*s],
+        [y*x*v + z*s, c + y*y*v,   y*z*v - x*s],
+        [z*x*v - y*s, z*y*v + x*s, c + z*z*v]
+    ])
+
+
+def scale_orientation(R_desired, R_zero, scale):
+    """在旋转矩阵空间缩放姿态: R_scaled = R_zero * (R_zero^-1 @ R_desired)^scale
+    用旋转向量实现，避免欧拉角线性插值的万向锁问题
+    """
+    R_rel = R_desired @ R_zero.T  # 相对旋转
+    axis, angle = rotation_vector_from_matrix(R_rel)
+    if abs(angle) < 1e-6 or abs(scale - 1.0) < 1e-6:
+        return R_desired if scale >= 1.0 else R_zero
+    R_scaled_rel = matrix_from_rotation_vector(axis, angle * scale)
+    return R_scaled_rel @ R_zero
+
+
+def unwrap_euler(current_deg, prev_deg):
+    """将欧拉角解缠绕到上一帧最近邻的等价解
+    解决 matrix_to_euler 在 ±180° 附近跳变的问题
+    (如 179° → -181° 物理一样, 但数值跳了 360°)
+    current_deg: 当前帧 [rx, ry, rz]°
+    prev_deg:    上一帧 [rx, ry, rz]°
+    返回: 解缠绕后的 [rx, ry, rz]°
+    """
+    unwrapped = []
+    for i in range(3):
+        diff = current_deg[i] - prev_deg[i]
+        # 调整到 [-180, 180] 范围内保持数值连续
+        unwrapped.append(current_deg[i] - round(diff / 360.0) * 360.0)
+    return unwrapped
+
+
+class JakaSDKController:
+    """JAKA SDK 控制器 (子进程通信)"""
+
+    def __init__(self, ip="10.5.5.100"):
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        ctrl_script = os.path.join(script_dir, "jaka_sdk_controller.py")
+        log_dir = os.path.join(script_dir, "logs")
+        os.makedirs(log_dir, exist_ok=True)
+
+        sdk_dir = os.path.join(script_dir,
+                               "jakaAPI_V2.1.11_stable_20240507091715A053",
+                               "SDK2.1.11", "Linux", "python3", "x86_64-linux-gnu")
+        env = os.environ.copy()
+        env["LD_LIBRARY_PATH"] = sdk_dir + ":" + env.get("LD_LIBRARY_PATH", "")
+
+        self.proc = subprocess.Popen(
+            ["/usr/bin/python3.8", ctrl_script],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=open(os.path.join(log_dir, "sdk_err.log"), "w"),
+            env=env, text=True, bufsize=1
+        )
+
+        self._send({"ip": ip})
+        self._wait_ready()
+
+    def _send(self, data):
+        self.proc.stdin.write(json.dumps(data, separators=(",", ":")) + "\n")
+        self.proc.stdin.flush()
+
+    def _read(self):
+        line = self.proc.stdout.readline()
+        return json.loads(line.strip()) if line else None
+
+    def _wait_ready(self):
+        self.init_joints = None
+        self.init_tcp = None
+        while True:
+            resp = self._read()
+            if resp is None:
+                raise RuntimeError("SDK controller died")
+            t = resp.get("type", "")
+            if t == "init":
+                self.init_joints = resp["joints"]
+                self.init_tcp = resp["tcp"]
+            elif t == "servo_enabled":
+                print(f"[JAKA] 伺服已启用 ✅")
+            elif t == "ready":
+                print(f"[JAKA] 初始关节: {[f'{math.degrees(a):.2f}°' for a in self.init_joints]}")
+                print(f"[JAKA] 初始 TCP:  x={self.init_tcp[0]:.1f} y={self.init_tcp[1]:.1f} z={self.init_tcp[2]:.1f} mm")
+                print(f"[JAKA] SDK 就绪 ✅")
+                break
+            elif t == "error":
+                raise RuntimeError(f"SDK error: {resp.get('message')}")
+
+    def servo_j(self, joints_rad: List[float]):
+        """发送 servo_j (fire-and-forget, 无流控)"""
+        self._send({"type": "servo_j", "joints": joints_rad})
+
+    def servo_j_from_tcp(self, tcp_cart: List[float], max_joint_delta: float = 0.05):
+        """从笛卡尔位姿 → IK → servo_j (带关节限幅)
+        tcp_cart: [x_mm, y_mm, z_mm, rx_rad, ry_rad, rz_rad]
+        max_joint_delta: 每步最大关节变化 (rad), 默认0.05≈3°
+        """
+        self._send({"type": "servo_j_from_tcp", "tcp": tcp_cart,
+                     "max_joint_delta": max_joint_delta})
+
+    def poll(self):
+        """快速消费子进程残留响应 (非阻塞)"""
+        import select
+        try:
+            for _ in range(5):
+                r, _, _ = select.select([self.proc.stdout], [], [], 0)
+                if not r:
+                    break
+                line = self.proc.stdout.readline()
+                if line:
+                    try:
+                        resp = json.loads(line.strip())
+                        if resp.get("type") == "servo_j_err":
+                            print(f"\n[SERVO-ERR] ❌ {resp.get('message','')}")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    def stop(self):
+        try:
+            self._send({"type": "shutdown"})
+            self.proc.wait(timeout=3)
+        except Exception:
+            self.proc.kill()
+
+
+class MasterSlaveV5:
+    """主从控制 v6 — 笛卡尔映射 + joint_move"""
+
+    def __init__(self, jaka_ip="10.5.5.100",
+                 ctrl_hz=200.0,
+                 pos_scale=0.35):
+        self.ctrl_hz = ctrl_hz
+        self.pos_scale = pos_scale
+        self.rot_scale = 1.0  # 姿态缩放(固定为1, 由旋转向量缩放处理)
+
+        # 笛卡尔软限位 (相对 JAKA 零位 TCP, 单位 mm)
+        # 防止 IK 解出超限关节角 (尤其 J3 正软限位)
+        self._cart_limits = {
+            'x': (-250, 250),
+            'y': (-250, 250),
+            'z': (-80,  350),
+        }
+
+        # 渐变启动: 前 N 帧从"从臂当前位置"平滑过渡到"映射目标"
+        self._ramp_frames = 80   # 80帧(~0.4s)完成渐变
+        self._start_pos = None   # 启动时的从臂 TCP 位置 (mm)
+        self._start_R = None     # 启动时的从臂 TCP 旋转矩阵
+        self._frame_cnt = 0      # 帧计数器
+
+        # 连接主臂
+        print("[INFO] 连接主臂 Alicia-D...")
+        self.leader = create_robot()
+        assert self.leader.is_connected(), "主臂连接失败"
+        print("[INFO] ✅ 主臂连接成功")
+
+        # 连接从臂
+        print(f"[INFO] 连接从臂 JAKA ({jaka_ip})...")
+        self.follower = JakaSDKController(ip=jaka_ip)
+
+        # 状态变量
+        self.lz_joints = None          # 主臂零位关节 (rad)
+        self.fz_joints = None          # 从臂零位关节 (rad)
+        self.lz_tcp_mat = None         # 主臂零位 TCP 4x4 矩阵
+        self.fz_tcp_mat = None         # 从臂零位 TCP 4x4 矩阵
+        self.fz_tcp_pos = None         # 从臂零位 TCP 位置 (mm)
+        self.smoothed_tcp = None       # TCP 目标 [x,y,z,rx,ry,rz]
+        self.prev_target_euler = None  # 上一帧欧拉角 (解缠绕用)
+
+        self.running = True
+        signal.signal(signal.SIGINT, lambda s, f: setattr(self, 'running', False))
+
+    def calibrate(self):
+        """校准: 记录零位矩阵 T_lz 和 T_fz"""
+        print("\n[INFO] ========== 校准 ==========")
+        print("[INFO] 请将双臂放在零位姿态, 静止不动...")
+        for i in range(3, 0, -1):
+            print(f"  {i}...", end=" ", flush=True)
+            time.sleep(1)
+        print()
+
+        # 读取主臂
+        st = self.leader.get_robot_state("joint", cache=False)
+        assert st is not None, "无法读取主臂"
+        self.lz_joints = list(st)
+
+        T = forward_kinematics(self.leader.robot_model, st, return_end=True)
+        alicia_tcp = np.eye(4)
+        alicia_tcp[:3, :3] = T[:3, :3]
+        alicia_tcp[:3, 3] = T[:3, 3] * 1000  # 转为 mm
+
+        # 读取从臂
+        self.fz_joints = list(self.follower.init_joints)
+        self.fz_tcp_mat = pos_euler_to_matrix(
+            self.follower.init_tcp[:3],
+            [math.degrees(a) for a in self.follower.init_tcp[3:]]
+        )
+        self.fz_tcp_pos = [float(x) for x in self.follower.init_tcp[:3]]
+
+        self.lz_tcp_mat = alicia_tcp.copy()
+
+        print(f"\n[MAP] 主臂零位: x={alicia_tcp[0,3]:.1f} y={alicia_tcp[1,3]:.1f} z={alicia_tcp[2,3]:.1f} mm")
+        print(f"[MAP] 从臂零位: x={self.fz_tcp_mat[0,3]:.1f} y={self.fz_tcp_mat[1,3]:.1f} z={self.fz_tcp_mat[2,3]:.1f} mm")
+        print(f"[MAP] 从臂偏转: rx={math.degrees(self.follower.init_tcp[3]):.1f}° ry={math.degrees(self.follower.init_tcp[4]):.1f}° rz={math.degrees(self.follower.init_tcp[5]):.1f}°")
+
+        # 初始化平滑 TCP 目标
+        init_tcp_rad = [float(x) for x in self.follower.init_tcp]
+        self.smoothed_tcp = list(init_tcp_rad)
+
+        print(f"[INFO] 控制频率: {self.ctrl_hz}Hz | 位置缩放: {self.pos_scale}")
+        print("[INFO] ============================\n")
+        self.calibrated = True
+
+    def get_leader_state(self):
+        """读取主臂: 关节 + TCP 齐次矩阵 (超时/断线时返回 None)"""
+        try:
+            st = self.leader.get_robot_state("joint", cache=False)
+            if st is None:
+                return None
+            T = forward_kinematics(self.leader.robot_model, st, return_end=True)
+            T_mat = np.eye(4)
+            T_mat[:3, :3] = T[:3, :3]
+            T_mat[:3, 3] = T[:3, 3] * 1000  # m → mm
+            return {'joints': list(st), 'T': T_mat}
+        except Exception:
+            return None  # 通讯超时/断线时静默跳过
+
+    def run(self):
+        try:
+            self.calibrate()
+        except Exception as e:
+            print(f"[ERROR] 校准失败: {e}")
+            import traceback; traceback.print_exc()
+            return
+
+        period = 1.0 / self.ctrl_hz
+        fc, fps_s, print_s = 0, time.time(), time.time()
+
+        print("[INFO] 主从控制运行中...\n")
+
+        while self.running:
+            try:
+                t_cycle = time.time()
+
+                # ========== 1. 读取主臂 ==========
+                state = self.get_leader_state()
+                if state is None:
+                    time.sleep(0.001)
+                    continue
+
+                leader_joints = state['joints']
+                T_leader = state['T']
+
+                # ========== 2. 笛卡尔空间映射 ==========
+                # 位置: 主臂相对零位偏移 → R_align 旋转对齐 → 缩放 → 叠加到从臂零位
+                # 姿态: R_fz @ R_leader @ R_lz.T (保持相对旋转一致)
+                # ⚠️ 注意: 必须用 R_leader @ R_lz.T, 不是 R_lz.T @ R_leader!
+                leader_pos = [T_leader[i,3] for i in range(3)]
+                R_leader = T_leader[:3, :3]
+                R_lz = self.lz_tcp_mat[:3, :3]
+                R_fz = self.fz_tcp_mat[:3, :3]
+
+                # 位置
+                delta_pos = np.array([leader_pos[i] - self.lz_tcp_mat[i,3] for i in range(3)])
+                R_align = R_fz @ R_lz.T  # 旋转对齐矩阵
+                rotated_delta = R_align @ delta_pos
+                des_pos = [
+                    self.fz_tcp_mat[i,3] + rotated_delta[i] * self.pos_scale
+                    for i in range(3)
+                ]
+
+                # 笛卡尔软限位 (相对从臂零位, 防超程/逆解失败)
+                if self.fz_tcp_pos is not None:
+                    for i, axis in enumerate(['x', 'y', 'z']):
+                        lo, hi = self._cart_limits[axis]
+                        des_pos[i] = max(self.fz_tcp_pos[i] + lo,
+                                         min(self.fz_tcp_pos[i] + hi, des_pos[i]))
+
+                # 姿态: 保持相对旋转一致
+                R_rel = R_leader @ R_lz.T  # ⚠️ 乘法顺序关键!
+                T_jaka_r = R_fz @ R_rel
+                des_euler_deg = [math.degrees(a) for a in matrix_to_euler(T_jaka_r, seq='xyz')]
+
+                # 欧拉角解缠绕
+                if self.prev_target_euler is not None:
+                    des_euler_deg = unwrap_euler(des_euler_deg, self.prev_target_euler)
+                self.prev_target_euler = list(des_euler_deg)
+
+                # 组合 TCP 目标 + 笛卡尔软限位
+                filtered = [
+                    des_pos[0], des_pos[1], des_pos[2],
+                    math.radians(des_euler_deg[0]),
+                    math.radians(des_euler_deg[1]),
+                    math.radians(des_euler_deg[2])
+                ]
+                self.smoothed_tcp = list(filtered)
+
+                # ========== 2a. 渐变启动 ==========
+                # 前 _ramp_frames 帧: 从"从臂当前位置" 平滑过渡到 "映射目标"
+                # 解决两臂零位无法重合导致的初始跳变
+                # ⚠️ 旋转用旋转矩阵 slerp, 不用欧拉角线性插值 (防等价解跳变)
+                if self._start_pos is None:
+                    # 第一帧: 缓存从臂当前位置作为起点 (位置mm + 旋转矩阵)
+                    self._start_pos = [float(x) for x in self.follower.init_tcp[:3]]
+                    start_euler = [float(a) for a in self.follower.init_tcp[3:]]
+                    self._start_R = euler_to_matrix(start_euler[0], start_euler[1], start_euler[2], seq='xyz')
+                ramp = min(1.0, self._frame_cnt / self._ramp_frames)
+                if ramp < 1.0:
+                    # 位置: 线性插值
+                    for i in range(3):
+                        filtered[i] = self._start_pos[i] + (filtered[i] - self._start_pos[i]) * ramp
+                    # 姿态: 旋转矩阵球面线性插值 (避免欧拉角跳变)
+                    target_R = euler_to_matrix(filtered[3], filtered[4], filtered[5], seq='xyz')
+                    blended_R = scale_orientation(target_R, self._start_R, ramp)
+                    blended_euler = matrix_to_euler(blended_R, seq='xyz')
+                    filtered[3] = blended_euler[0]
+                    filtered[4] = blended_euler[1]
+                    filtered[5] = blended_euler[2]
+
+                # ========== 3. 发送 servo_j_from_tcp (IK → servo_j) ==========
+                # 子进程已改为 servo_j 发送，无 joint_move 轨迹规划延迟
+                self._frame_cnt += 1
+                if self._frame_cnt % 4 == 0:
+                    self.follower.servo_j_from_tcp(filtered, max_joint_delta=0.06)
+                    # 调试: 打印前几帧发送的 TCP 目标
+                    if self._frame_cnt < 10:
+                        print(f"[DEBUG] 发送 TCP: x={filtered[0]:.1f} y={filtered[1]:.1f} z={filtered[2]:.1f} "
+                              f"rx={math.degrees(filtered[3]):.1f}° ry={math.degrees(filtered[4]):.1f}° rz={math.degrees(filtered[5]):.1f}°")
+                # 定期消费子进程错误响应
+                if self._frame_cnt % 20 == 0:
+                    self.follower.poll()
+
+                # ========== 5. 显示 ==========
+                fc += 1
+                if time.time() - print_s >= 0.5:
+                    # 主臂 TCP 偏移 (相对零位)
+                    d_pos = [T_leader[i,3] - self.lz_tcp_mat[i,3] for i in range(3)]
+                    d_pos_mm = math.sqrt(d_pos[0]**2 + d_pos[1]**2 + d_pos[2]**2)
+                    # JAKA 目标 TCP 偏移 (相对零位)
+                    zero_tcp = [float(x) for x in self.follower.init_tcp[:3]]
+                    d_jaka = [filtered[i] - zero_tcp[i] for i in range(3)]
+                    d_jaka_mm = math.sqrt(d_jaka[0]**2 + d_jaka[1]**2 + d_jaka[2]**2)
+                    ratio_str = f"比例: {d_jaka_mm/d_pos_mm:.2f}" if d_pos_mm > 1 else "比例: N/A (静止)"
+                    # Alicia 在其自身基座下的位姿
+                    leader_rpy = [math.degrees(a) for a in matrix_to_euler(T_leader[:3,:3], seq='xyz')]
+                    # JAKA 目标到零位的距离 (用于超程预警)
+                    zero_tcp = [float(x) for x in self.follower.init_tcp[:3]]
+                    jaka_dist = math.sqrt(
+                        (filtered[0]-zero_tcp[0])**2 +
+                        (filtered[1]-zero_tcp[1])**2 +
+                        (filtered[2]-zero_tcp[2])**2
+                    )
+                    dist_warn = "⚠️" if jaka_dist > 250 else ""
+                    print(f"\n{'='*75}")
+                    print(f"  位置缩放={self.pos_scale} | 姿态缩放={self.rot_scale if hasattr(self,'rot_scale') else 1.0}")
+                    print(f"  Alicia偏移: {d_pos_mm:6.1f} mm  → JAKA偏移: {d_jaka_mm:6.1f} mm  {ratio_str}  |  JAKA距零位: {jaka_dist:.0f}mm{dist_warn}")
+                    print(f"  ┌─ 示教臂(Alicia) 基坐标系 ─────────────────────────────────┐")
+                    print(f"  │ 位置: x={T_leader[0,3]:8.1f}  y={T_leader[1,3]:8.1f}  z={T_leader[2,3]:8.1f} mm │")
+                    print(f"  │ 姿态: rx={leader_rpy[0]:7.2f}° ry={leader_rpy[1]:7.2f}° rz={leader_rpy[2]:7.2f}°    │")
+                    # 从臂目标在其基座下的位姿 (缩放后)
+                    jaka_rpy = [math.degrees(a) for a in filtered[3:6]]
+                    print(f"  ├─ 从臂(JAKA)  基坐标系 (目标) ─────────────────────────────┤")
+                    print(f"  │ 位置: x={filtered[0]:8.1f}  y={filtered[1]:8.1f}  z={filtered[2]:8.1f} mm │")
+                    print(f"  │ 姿态: rx={jaka_rpy[0]:7.2f}° ry={jaka_rpy[1]:7.2f}° rz={jaka_rpy[2]:7.2f}°    │")
+                    print(f"  └────────────────────────────────────────────────────────────┘")
+                    print(f"{'='*75}")
+                    print_s = time.time()
+
+                if time.time() - fps_s >= 5.0:
+                    fps = fc / (time.time() - fps_s)
+                    print(f"[INFO] 频率: {fps:.0f} Hz")
+                    fc, fps_s = 0, time.time()
+
+                # 限制循环频率 ~200Hz (5ms周期)
+                time.sleep(max(0, 0.005 - (time.time() - t_cycle)))
+
+            except (BrokenPipeError, OSError):
+                print("\n[FATAL] 子进程已崩溃，退出")
+                self.running = False
+            except KeyboardInterrupt:
+                break
+            except Exception as e:
+                print(f"\n[ERROR] {e}")
+                import traceback; traceback.print_exc()
+                time.sleep(0.1)
+
+        self.running = False
+        try: self.leader.disconnect()
+        except: pass
+        try: self.follower.stop()
+        except: pass
+        print("[INFO] ✅ 已退出")
+
+
+def main():
+    print("="*65)
+    print("  Alicia-D → JAKA 主从控制 v8 (笛卡尔映射+IK+软限位)")
+    print("  齐次变换 → 笛卡尔空间映射 → kine_inverse → servo_j")
+    print("="*65)
+    print()
+
+    c = MasterSlaveV5(
+        jaka_ip="10.5.5.100",
+        ctrl_hz=200.0,
+        pos_scale=0.35,
+    )
+    c.run()
+
+
+if __name__ == "__main__":
+    main()
